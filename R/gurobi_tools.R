@@ -268,6 +268,7 @@ solve_model <- function(model, obj_idx, sense = 'max'){
 #' @param reaction_indexes indexes for reactions to check; check all if empty
 #' @param compare_mtx boolean to indicate whether or not to couple known sets together if any individual reactions are coupled; FALSE by default
 #' @param known_set_mtx boolean matrix of known coupling between reactions
+#' @param directional boolean to indicate whether to check for directional coupling between reactions
 #' @return boolean matrix indicating whether reactions are coupled to each other (reactions are assigned to rows and columns)
 #' @seealso 
 #' @export
@@ -275,7 +276,9 @@ solve_model <- function(model, obj_idx, sense = 'max'){
 #' 
 flux_coupling_raptor <- function(model, min_fva_cor=0.9, fix_frac=0.1, fix_tol_frac=0.01,
                                  bnd_tol = 0.1, stored_obs = 4000, cor_iter = 5, cor_check = TRUE,
-                                 reaction_indexes = c(), compare_mtx = FALSE, known_set_mtx = Matrix(data = FALSE, nrow = 1, ncol = 1, sparse = TRUE)) {
+                                 reaction_indexes = c(), compare_mtx = FALSE, 
+                                 known_set_mtx = Matrix(data = FALSE, nrow = 1, ncol = 1, sparse = TRUE),
+                                 directional = FALSE) {
   
   # min_fva_cor is minimum correlation between fluxes
   # bnd_tol is allowed error in comparing max & min flux
@@ -369,6 +372,87 @@ flux_coupling_raptor <- function(model, min_fva_cor=0.9, fix_frac=0.1, fix_tol_f
     
     list(coupled = coupled, active = active)
   }
+  
+  check_directional_coupling <- function(i, j, fixed = TRUE){
+    
+    info <- list(lp_calls = 0,
+                 coupled = FALSE)
+    
+    prev_ub_i <- model$ub[i]
+    prev_lb_i <- model$lb[i]
+    
+    if (!fixed){
+      fixed_val <- 0.01
+      if (!near(global_max[i], 0, tol = bnd_tol) | !near(global_min[i], 0, tol = bnd_tol)){
+        fixed_val <- rxn_fix(global_max[i], global_min[i])
+      }
+      else {
+        if (!near(model$ub[i], 0)){ #model$getattr("UB")[vars[i]] > tol
+          
+          model$obj[i] <- 1
+          model$modelsense <- 'max'
+          sol <- gurobi(model, list(OutputFlag = 0))
+          info$lp_calls <- info$lp_calls + 1
+          global_max <- pmax(global_max, sol$x)
+          global_min <- pmin(global_min, sol$x)
+          #flux <- update_flux(flux, lp_calls%%stored_obs, sol$X)
+          # flux[lp_calls%%stored_obs,] <- sol$x
+          
+          if (!near(global_max[i], 0) | !near(global_min[i], 0)){
+            fixed_val <- rxn_fix(global_max[i], global_min[i])
+          }
+          
+          model$obj <- rep(0, n)
+        }
+        if (!near(model$lb[i], 0)){ #model$getattr("LB")[vars[i]] < (-1*tol_)
+          
+          model$obj[i] <- 1
+          model$modelsense <- 'min'
+          sol <- gurobi(model, list(OutputFlag = 0))
+          info$lp_calls <- info$lp_calls + 1
+          #print(is.null(flux))
+          global_max <- pmax(global_max, sol$x)
+          global_min <- pmin(global_min, sol$x)
+          #flux <- update_flux(flux, lp_calls%%stored_obs, sol$X)
+          # flux[lp_calls%%stored_obs,] <- sol$x
+          
+          if (!near(global_max[i], 0) | !near(global_min[i], 0)){
+            fixed_val <- rxn_fix(global_max[i], global_min[i])
+          }
+          
+          model$obj <- rep(0, n)
+        }
+        
+        model$ub[i] <- fixed_val
+        model$lb[i] <- fixed_val
+      }
+    }
+    
+    prev_ub_j <- model$ub[j]
+    prev_lb_j <- model$lb[j]
+    
+    # zero out target bounds
+    model$ub[j] <- 0
+    model$lb[j] <- 0
+    
+    # check feasibility
+    sol <- gurobi(model, list(OutputFlag = 0))
+    
+    info$lp_calls <- info$lp_calls + 1
+    
+    feasible <- !(length(sol$x) == 0)
+    info$coupled <- feasible
+    
+    model$ub[j] <- prev_ub_j
+    model$lb[j] <- prev_lb_j
+    
+    model$ub[i] <- prev_ub_i
+    model$lb[i] <- prev_lb_i
+    
+    
+    return(info)
+  }
+  
   
   for (idx in 1:(length(reaction_indexes))) { # (i in 1:(n-1))
     # iterate over passed in idxs instead (idx in 1:length(reaction_indexes)); i <-  reaction_indexes[idx]
@@ -498,6 +582,30 @@ flux_coupling_raptor <- function(model, min_fva_cor=0.9, fix_frac=0.1, fix_tol_f
           active <- output$active
         }
       }
+      
+      if (skip & directional){
+        dir_i_j <- check_directional_coupling(i, j, fixed = TRUE)
+        lp_calls <- lp_calls + dir_i_j$lp_calls
+        
+        if (dir_i_j$coupled){
+          coupled[i,j] <- TRUE
+          next
+        }
+        
+        dir_j_i <- check_directional_coupling(j, i, fixed = FALSE)
+        lp_calls <- lp_calls + dir_j_i$lp_calls
+        
+        if (dir_j_i$coupled){
+          coupled[j,i] <- TRUE
+        }
+        
+        if (dir_i_j$coupled | dir_j_i$coupled){
+          coupled[i,j] <- TRUE
+          coupled[j,i] <- TRUE
+          active[j] <- FALSE
+        }
+      }
+      
       
       model$obj <- rep(0, n)
     }
